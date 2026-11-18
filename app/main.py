@@ -1,4 +1,4 @@
-"""FastAPI 入口：迁移控制、进度查询、父表查询、采集写入演示、一致性校验。"""
+"""FastAPI 入口：迁移控制、进度查询、父表查询、采集写入演示、一致性校验、站号接续。"""
 
 from __future__ import annotations
 
@@ -7,11 +7,13 @@ import random
 import threading
 from pathlib import Path
 
+import psycopg
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 import migrator
+import succession
 from db import connect, ensure_meta_tables, log, logs_since
 from migrator import (
     AlreadyDone,
@@ -21,6 +23,7 @@ from migrator import (
     parse_month,
     start_migration,
 )
+from succession import SuccessionConflict
 
 app = FastAPI(title="观测数据月分区在线迁移")
 STATIC = Path(__file__).parent / "static"
@@ -183,6 +186,57 @@ def _random_ts_in_month(conn, lo: str, hi: str) -> str:
     ).fetchone()[0].isoformat()
 
 
+def _targeted_write(req: "WriteReq") -> dict:
+    """定向写入：显式指定站号/时刻（可再指定新站号/新时刻做改号、跨界改时刻）。
+
+    与随机写入一样走独立连接直接 SQL；接续边界由数据库触发器强制，
+    违规时抛出的异常由上层统一转成 409。
+    """
+    station = (req.station_id or "").strip()
+    if not station or not req.ts:
+        raise HTTPException(status_code=400,
+                            detail="定向写入需要 station_id 与 ts")
+    ts = succession.parse_ts(req.ts)
+    with connect() as conn:  # 独立连接，自动提交
+        if req.op == "insert":
+            value = req.value if req.value is not None else random.randint(0, 100)
+            row = conn.execute(
+                "INSERT INTO observations (station_id, ts, value)"
+                " VALUES (%s, %s, %s) ON CONFLICT DO NOTHING"
+                " RETURNING station_id, ts, value",
+                (station, ts, value),
+            ).fetchone()
+            if not row:
+                return {"op": "insert", "skipped": "主键冲突，未写入"}
+            return {"op": "insert", "station_id": row[0],
+                    "ts": row[1].isoformat(), "value": row[2]}
+        if req.op == "update":
+            new_station = (req.new_station_id or "").strip() or station
+            new_ts = succession.parse_ts(req.new_ts) if req.new_ts else ts
+            value = req.value if req.value is not None else random.randint(0, 100)
+            row = conn.execute(
+                "UPDATE observations SET station_id = %s, ts = %s, value = %s"
+                " WHERE station_id = %s AND ts = %s"
+                " RETURNING station_id, ts, value",
+                (new_station, new_ts, value, station, ts),
+            ).fetchone()
+            if not row:
+                return {"op": "update", "skipped": "目标行不存在"}
+            return {"op": "update", "station_id": row[0],
+                    "ts": row[1].isoformat(), "value": row[2]}
+        if req.op == "delete":
+            row = conn.execute(
+                "DELETE FROM observations WHERE station_id = %s AND ts = %s"
+                " RETURNING station_id, ts, value",
+                (station, ts),
+            ).fetchone()
+            if not row:
+                return {"op": "delete", "skipped": "目标行不存在"}
+            return {"op": "delete", "station_id": row[0],
+                    "ts": row[1].isoformat(), "old_value": row[2]}
+    raise HTTPException(status_code=400, detail=f"未知操作: {req.op}")
+
+
 def demo_write(op: str, month: str) -> dict:
     """模拟独立采集连接：每次新建连接，对父表直接 INSERT/UPDATE/DELETE。"""
     m = parse_month(month)
@@ -233,12 +287,31 @@ def demo_write(op: str, month: str) -> dict:
 
 class WriteReq(BaseModel):
     op: str
-    month: str
+    month: str | None = None
+    # 定向写入（可选）：显式站号/时刻/测值，update 可再改站号与时刻
+    station_id: str | None = None
+    ts: str | None = None
+    value: int | None = None
+    new_station_id: str | None = None
+    new_ts: str | None = None
 
 
 @app.post("/api/demo/write")
 def api_demo_write(req: WriteReq):
-    result = demo_write(req.op, req.month)
+    try:
+        if req.station_id or req.ts:
+            result = _targeted_write(req)
+        else:
+            if not req.month:
+                raise HTTPException(status_code=400, detail="随机写入需要 month")
+            result = demo_write(req.op, req.month)
+    except psycopg.Error as e:
+        # 接续边界等数据库侧拒绝：写入已整体回滚，接续关系不受影响
+        log(f"[采集写入] 被拒绝: {e.diag.message_primary if e.diag else e}")
+        raise HTTPException(
+            status_code=409,
+            detail=e.diag.message_primary if e.diag else str(e),
+        ) from None
     log(f"[采集写入] {result}")
     return result
 
@@ -300,6 +373,48 @@ def api_debug_crash():
     log("[debug] 收到崩溃指令，进程即将硬退出（模拟宕机）")
     threading.Timer(0.2, lambda: os._exit(1)).start()
     return {"crashing": True}
+
+
+# ----------------------------------------------------------------- 站号接续
+class SuccessionReq(BaseModel):
+    old_station: str
+    new_station: str
+    effective_at: str  # ISO 8601，缺省时区按 UTC
+
+
+@app.get("/api/successions")
+def api_successions():
+    return {"successions": succession.list_successions()}
+
+
+@app.post("/api/successions", status_code=201)
+def api_register_succession(req: SuccessionReq):
+    try:
+        rec = succession.register_succession(
+            req.old_station, req.new_station,
+            succession.parse_ts(req.effective_at),
+        )
+    except SuccessionConflict as e:
+        log(f"[站号接续] 登记被拒绝: {e}")
+        raise HTTPException(status_code=409, detail=str(e)) from None
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    log(f"[站号接续] 已登记: {rec['old_station']} → {rec['new_station']}"
+        f" @ {rec['effective_at']}")
+    return rec
+
+
+@app.get("/api/succession/query")
+def api_succession_query(station: str, month: str, limit: int = 1000):
+    m = parse_month(month)
+    try:
+        result = succession.spliced_query(
+            station, m.isoformat(), next_month(m).isoformat(), limit
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    result["month"] = month
+    return result
 
 
 # --------------------------------------------------------------------- 校验

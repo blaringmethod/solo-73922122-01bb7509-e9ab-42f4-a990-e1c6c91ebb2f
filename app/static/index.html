@@ -48,9 +48,11 @@
 </head>
 <body>
 <header>
-  <h1>环境监测数仓 · 默认分区 → 月分区在线迁移</h1>
+  <h1>环境监测数仓 · 默认分区 → 月分区在线迁移 · 站号接续</h1>
   <p>观测表 observations 按 UTC 时刻 RANGE 分区，主键 (站号, 时刻)。历史数据 initially 全部在默认分区；
-     选择月份后在线建立并接入该月分区，复制期间采集写入（新增/更正/删除）不中断，仅最终切换瞬间短暂锁表。</p>
+     选择月份后在线建立并接入该月分区，复制期间采集写入（新增/更正/删除）不中断，仅最终切换瞬间短暂锁表。
+     监测站换号时可登记站号接续（旧号→新号 + UTC 生效时刻）：生效前只取旧号、生效后只取新号，
+     登记后独立 SQL 写入同样受边界约束，父表始终保留原始站号。</p>
 </header>
 <main>
   <!-- 月份总览 -->
@@ -98,6 +100,17 @@
       <button id="wAuto" class="ghost">启动自动采集</button>
       <span id="wState" class="dim">已停止</span>
     </div>
+    <div class="row">
+      <label>定向</label>
+      <select id="tOp"><option value="insert">insert</option>
+        <option value="update">update</option><option value="delete">delete</option></select>
+      <input id="tStation" placeholder="站号" style="width:80px">
+      <input id="tTs" placeholder="时刻UTC 2026-11-18 12:00" style="width:190px">
+      <input id="tValue" type="number" placeholder="测值" style="width:70px">
+      <input id="tNewStation" placeholder="新站号(可空)" style="width:90px">
+      <input id="tNewTs" placeholder="新时刻(可空)" style="width:170px">
+      <button class="ghost" onclick="doTargetedWrite()">执行</button>
+    </div>
     <div id="wLast" class="mono dim" style="font-size:12px">—</div>
   </section>
 
@@ -122,6 +135,33 @@
       <button onclick="doVerify()">校验</button>
     </div>
     <div id="vResult" class="mono" style="font-size:13px;white-space:pre-wrap">—</div>
+  </section>
+
+  <!-- 站号接续 -->
+  <section class="card wide">
+    <h2>⑥ 站号接续（换号登记 · 边界强制 · 按新号拼接查询）</h2>
+    <div class="row">
+      <label>旧站号</label><input id="sOld" placeholder="如 ST001" style="width:90px">
+      <label>新站号</label><input id="sNew" placeholder="如 ST009" style="width:90px">
+      <label>生效时刻(UTC)</label><input id="sEff" placeholder="2026-11-18 12:00:00" style="width:180px">
+      <button onclick="registerSuccession()">登记接续</button>
+      <span class="dim">每个站号只能参与一次；已有数据越界则整单拒绝</span>
+    </div>
+    <div id="sMsg" class="mono" style="font-size:12px;margin:4px 0">—</div>
+    <table id="succ">
+      <thead><tr><th>#</th><th>旧站号</th><th>新站号</th><th>生效时刻(UTC)</th><th>登记时间(UTC)</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="row" style="margin-top:10px">
+      <label>接续查询</label>
+      <input id="sStation" placeholder="新站号(或旧站号)" style="width:130px">
+      <label>月份</label><select id="sMonth"></select>
+      <button onclick="doSpliceQuery()">查询拼接结果</button>
+      <span class="dim">生效前取旧号、生效后取新号；父表保留原始站号</span>
+    </div>
+    <div id="sSummary" class="mono" style="font-size:13px;margin:6px 0">—</div>
+    <table id="sRows"><thead><tr><th>原始站号</th><th>时刻(UTC)</th><th>测值</th><th>接续段</th></tr></thead>
+      <tbody></tbody></table>
   </section>
 
   <!-- 日志 -->
@@ -183,13 +223,73 @@ async function refresh() {
 }
 
 function syncSelects(months) {
-  for (const id of ['mMonth','wMonth','qMonth','vMonth']) {
+  for (const id of ['mMonth','wMonth','qMonth','vMonth','sMonth']) {
     const el = document.getElementById(id);
     const cur = el.value;
     if (el.dataset.sig === months.join(',')) continue;
     el.dataset.sig = months.join(',');
     el.innerHTML = months.map(m => `<option>${m}</option>`).join('');
     if (cur && months.includes(cur)) el.value = cur;
+  }
+}
+
+async function refreshSuccessions() {
+  try {
+    const r = await api('/api/successions');
+    document.querySelector('#succ tbody').innerHTML = r.successions.map(s => `
+      <tr><td>${s.id}</td><td class="mono">${s.old_station}</td>
+          <td class="mono">${s.new_station}</td>
+          <td class="mono">${s.effective_at}</td>
+          <td class="mono dim">${s.created_at}</td></tr>`).join('');
+  } catch (e) {}
+}
+
+async function registerSuccession() {
+  const body = { old_station: document.getElementById('sOld').value,
+    new_station: document.getElementById('sNew').value,
+    effective_at: document.getElementById('sEff').value };
+  const el = document.getElementById('sMsg');
+  try {
+    const r = await api('/api/successions', {method:'POST', body: JSON.stringify(body)});
+    el.innerHTML = `<span class="ok">已登记 #${r.id}：${r.old_station} → ${r.new_station} @ ${r.effective_at}</span>`;
+    refreshSuccessions();
+  } catch (e) {
+    el.innerHTML = `<span class="bad">登记被拒绝：${e.message}</span>`;
+  }
+}
+
+async function doSpliceQuery() {
+  const station = document.getElementById('sStation').value.trim();
+  const month = document.getElementById('sMonth').value;
+  if (!station) { alert('请输入站号'); return; }
+  try {
+    const r = await api(`/api/succession/query?station=${encodeURIComponent(station)}&month=${month}&limit=200`);
+    const s = r.succession;
+    document.getElementById('sSummary').innerHTML = s
+      ? `接续关系 #${s.id}：<b>${s.old_station}</b> → <b>${s.new_station}</b>，` +
+        `生效 <span class="mono">${s.effective_at}</span>；${r.month} 拼接共 <b>${r.count}</b> 行，` +
+        `测值合计 ${r.value_sum}（生效前取旧号、生效后取新号）`
+      : `站号 ${r.station} 未参与接续，普通查询：${r.month} 共 <b>${r.count}</b> 行`;
+    const legName = {old:'旧号段', new:'新号段', plain:'—'};
+    document.querySelector('#sRows tbody').innerHTML = r.rows.map(x =>
+      `<tr><td class="mono">${x.station_id}</td><td class="mono">${x.ts}</td>` +
+      `<td>${x.value}</td><td>${legName[x.leg] || x.leg}</td></tr>`).join('');
+  } catch (e) { alert('查询失败：' + e.message); }
+}
+
+async function doTargetedWrite() {
+  const body = { op: document.getElementById('tOp').value,
+    station_id: document.getElementById('tStation').value || null,
+    ts: document.getElementById('tTs').value || null,
+    value: document.getElementById('tValue').value === '' ? null : +document.getElementById('tValue').value,
+    new_station_id: document.getElementById('tNewStation').value || null,
+    new_ts: document.getElementById('tNewTs').value || null };
+  const el = document.getElementById('wLast');
+  try {
+    const r = await api('/api/demo/write', {method:'POST', body: JSON.stringify(body)});
+    el.textContent = JSON.stringify(r);
+  } catch (e) {
+    el.innerHTML = `<span class="bad">写入被拒绝：${e.message}</span>`;
   }
 }
 
@@ -288,8 +388,10 @@ document.getElementById('qAuto').onchange = e => {
 };
 setInterval(refresh, 1000);
 setInterval(pollLog, 1000);
+setInterval(refreshSuccessions, 2000);
 setInterval(() => { if (document.getElementById('qAuto').checked) doQuery(); }, 1000);
 refresh();
+refreshSuccessions();
 </script>
 </body>
 </html>
